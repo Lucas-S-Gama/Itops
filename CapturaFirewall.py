@@ -2,7 +2,7 @@
 Captura de métricas de firewalls (simulados) a cada 1 minuto.
 
 Coleta:
-  - ID_firewall      : alterna entre os firewalls fw02, fw01 e fw03 (um por ciclo)
+  - ID_firewall      : alterna entre os firewalls configurados (um por ciclo)
   - Active_sessions  : número de sessões TCP/UDP ativas (psutil.net_connections),
                        com fallback para valor simulado se faltar permissão
   - Dropped_packets  : pacotes descartados (dropin + dropout de psutil.net_io_counters())
@@ -10,45 +10,52 @@ Coleta:
   - CPU/RAM_Usage    : uso de CPU e RAM em percentual
   - Bytes_Sent/Recv  : contadores de rede via psutil.net_io_counters()
 
-Armazenamento:
-  - Pasta 'firewalls/' (criada automaticamente se não existir)
-  - Um arquivo JSON por dia PARA CADA firewall, no formato:
-        AAAA-MM-DD_HH-MM_fwXX.json   (ex.: 2026-04-06_10-30_fw01.json)
+Armazenamento (AWS S3):
+  - Bucket e prefixo ("pasta") configurados abaixo
+  - Um objeto JSON por dia PARA CADA firewall, no formato:
+        <PREFIXO_S3>/AAAA-MM-DD_HH-MM_fwXX.json   (ex.: firewalls/2026-04-06_10-30_fw01.json)
     O HH-MM é o horário da primeira captura daquele firewall no dia, quando o
-    arquivo é criado. Nas capturas seguintes do mesmo dia, os registros são
-    adicionados ao mesmo arquivo. Ao virar o dia, novos arquivos são criados.
+    objeto é criado. Nas capturas seguintes do mesmo dia, os registros são
+    adicionados ao mesmo objeto. Ao virar o dia, novos objetos são criados.
 
 Para encerrar, use Ctrl+C.
 """
 
-import boto3
-import glob
+import io
 import itertools
-import os
 import random
 import time
 from datetime import datetime
-
+from dotenv import load_dotenv 
+import os
+import boto3
 import pandas as pd
 import psutil
+from botocore.exceptions import ClientError
 
-# AWS
-session = boto3.Session(
- aws_access_key_id=AWS_ACCESS_KEY_ID,
- aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
- aws_session_token=AWS_SESSION_TOKEN,
- region_name="us-east-1", # Substitua pela sua região se necessário
-)
-s3_client = session.client("s3")
-bucket_name = "seu-nome-do-bucket"
-file_key = "caminho/para/o/seu_arquivo.csv"
-response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
-df = pandas.read_csv(io.BytesIO(response["Body"].read()), sep=";")
+load_dotenv()
+
 
 # ----------------------------- Configurações ------------------------------
+# AWS  (preencha com as informações corretas)
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+AWS_REGION = os.getenv("AWS_REGION")
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+PREFIXO_S3 = os.getenv("PREFIXO_S3")
+
 FIREWALLS = ["fw01"]  # ordem de alternância entre os firewalls
-PASTA_SAIDA = "firewalls"
 INTERVALO_SEGUNDOS = 60            # loop de 1 em 1 minuto
+
+# Cliente S3
+session = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    aws_session_token=AWS_SESSION_TOKEN,
+    region_name=AWS_REGION,
+)
+s3_client = session.client("s3")
 
 
 # ------------------------------- Coleta -----------------------------------
@@ -91,46 +98,71 @@ def coletar_metricas(id_firewall: str) -> dict:
 
 
 # ----------------------------- Armazenamento ------------------------------
-def obter_caminho_do_dia(id_firewall: str) -> str:
+def obter_chave_do_dia(id_firewall: str) -> str:
     """
-    Retorna o caminho do JSON do dia atual para o firewall informado.
-    Se já existir um arquivo de hoje para ele, reutiliza; senão, define um
-    novo com o horário atual no nome (AAAA-MM-DD_HH-MM_fwXX.json).
+    Retorna a chave (caminho no bucket) do JSON do dia atual para o firewall.
+    Se já existir um objeto de hoje para ele, reutiliza; senão, define uma
+    nova chave com o horário atual (PREFIXO/AAAA-MM-DD_HH-MM_fwXX.json).
     """
-    os.makedirs(PASTA_SAIDA, exist_ok=True)
-
     agora = datetime.now()
     data_hoje = agora.strftime("%Y-%m-%d")
 
-    existentes = sorted(
-        glob.glob(os.path.join(PASTA_SAIDA, f"{data_hoje}_*_{id_firewall}.json"))
-    )
+    prefixo_busca = f"{PREFIXO_S3}/{data_hoje}_"
+    sufixo = f"_{id_firewall}.json"
+
+    existentes = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for pagina in paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefixo_busca):
+        for obj in pagina.get("Contents", []):
+            if obj["Key"].endswith(sufixo):
+                existentes.append(obj["Key"])
+
     if existentes:
-        return existentes[0]
+        return sorted(existentes)[0]
 
     nome = f"{data_hoje}_{agora.strftime('%H-%M')}_{id_firewall}.json"
-    return os.path.join(PASTA_SAIDA, nome)
+    return f"{PREFIXO_S3}/{nome}"
+
+
+def ler_json_s3(chave: str) -> pd.DataFrame | None:
+    """Lê o JSON do S3 e devolve um DataFrame. Retorna None se o objeto não existir."""
+    try:
+        resposta = s3_client.get_object(Bucket=BUCKET_NAME, Key=chave)
+    except ClientError as erro:
+        if erro.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    conteudo = resposta["Body"].read().decode("utf-8")
+    return pd.read_json(io.StringIO(conteudo), orient="records", dtype=False)
 
 
 def salvar_json(registro: dict) -> tuple[str, int]:
-    """Adiciona o registro ao JSON do dia do firewall. Retorna (caminho, total de linhas)."""
-    caminho = obter_caminho_do_dia(registro["ID_firewall"])
+    """Adiciona o registro ao JSON do dia do firewall no S3. Retorna (chave, total de linhas)."""
+    chave = obter_chave_do_dia(registro["ID_firewall"])
     novo = pd.DataFrame([registro])
 
-    if os.path.exists(caminho):
-        try:
-            historico = pd.read_json(caminho, orient="records", dtype=False)
-            df = pd.concat([historico, novo], ignore_index=True)
-        except ValueError:
-            print("[AVISO] Arquivo JSON inválido/vazio. Recriando o arquivo...")
-            df = novo
+    try:
+        historico = ler_json_s3(chave)
+    except ValueError:
+        print("[AVISO] Arquivo JSON inválido/vazio. Recriando o arquivo...")
+        historico = None
+
+    if historico is not None:
+        df = pd.concat([historico, novo], ignore_index=True)
     else:
-        print(f"[INFO] Novo dia/arquivo. Criando '{caminho}'...")
+        print(f"[INFO] Novo dia/arquivo. Criando 's3://{BUCKET_NAME}/{chave}'...")
         df = novo
 
     df["Timestamp"] = df["Timestamp"].astype(str)
-    df.to_json(caminho, orient="records", indent=4, force_ascii=False)
-    return caminho, len(df)
+    corpo = df.to_json(orient="records", indent=4, force_ascii=False)
+
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=chave,
+        Body=corpo.encode("utf-8"),
+        ContentType="application/json",
+    )
+    return chave, len(df)
 
 
 # ------------------------------ Execução ----------------------------------
@@ -138,11 +170,11 @@ def main() -> None:
     print("=" * 60)
     print(" Monitoramento de firewalls iniciado")
     print(f" Firewalls (em rodízio): {' -> '.join(FIREWALLS)}")
-    print(f" Intervalo: {INTERVALO_SEGUNDOS}s | Pasta: {PASTA_SAIDA}/")
+    print(f" Intervalo: {INTERVALO_SEGUNDOS}s | Destino: s3://{BUCKET_NAME}/{PREFIXO_S3}/")
     print(" Pressione Ctrl+C para encerrar.")
     print("=" * 60)
 
-    rodizio = itertools.cycle(FIREWALLS)  # fw02 -> fw01 -> fw03 -> fw02 -> ...
+    rodizio = itertools.cycle(FIREWALLS)
     ciclo = 0
     try:
         while True:
@@ -168,8 +200,11 @@ def main() -> None:
                 f"Recebidos: {registro['Bytes_Recv']:,} bytes"
             )
 
-            caminho, total = salvar_json(registro)
-            print(f"[SALVO]   {id_firewall} gravado em '{caminho}' (total no dia: {total}).")
+            chave, total = salvar_json(registro)
+            print(
+                f"[SALVO]   {id_firewall} gravado em 's3://{BUCKET_NAME}/{chave}' "
+                f"(total no dia: {total})."
+            )
 
             # Desconta o tempo gasto na coleta para manter o intervalo de ~60s
             espera = 60 - (time.time() % 60)

@@ -15,29 +15,41 @@ Coleta (por AP):
   - Active_conn      : contagem SIMULADA de dispositivos (varia entre as APs)
   - CPU/RAM_Usage    : percentual real com pequena variação por AP
 
-Armazenamento:
-  - Pasta 'antenas/' (criada automaticamente se não existir)
-  - Um arquivo JSON por dia PARA CADA antena, no formato:
-        AAAA-MM-DD_HH-MM_apXX.json   (ex.: 2026-04-06_10-30_ap01.json)
+Armazenamento (AWS S3):
+  - Bucket e prefixo ("pasta") configurados abaixo
+  - Um objeto JSON por dia PARA CADA antena, no formato:
+        <PREFIXO_S3>/AAAA-MM-DD_HH-MM_apXX.json   (ex.: 01-bronze/2026-04-06_10-30_ap01.json)
     O HH-MM é o horário da primeira captura daquela antena no dia, quando o
-    arquivo é criado. Nas capturas seguintes do mesmo dia, os registros são
-    adicionados ao mesmo arquivo. Ao virar o dia, novos arquivos são criados.
+    objeto é criado. Nas capturas seguintes do mesmo dia, os registros são
+    adicionados ao mesmo objeto. Ao virar o dia, novos objetos são criados.
 
 Para encerrar, use Ctrl+C.
 """
 
-import glob
-import os
+import io
 import random
 import time
 from datetime import datetime
 
+import os
+from dotenv import load_dotenv;
+import boto3
 import pandas as pd
 import psutil
+from botocore.exceptions import ClientError
 
+
+load_dotenv()
 # ----------------------------- Configurações ------------------------------
+# AWS  (preencha com as informações corretas)
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
+AWS_REGION = os.getenv("AWS_REGION")
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+PREFIXO_S3 = os.getenv("PREFIXO_S3")
+
 ANTENAS = ["ap01", "ap02", "ap03"]
-PASTA_SAIDA = "antenas"
 INTERVALO_SEGUNDOS = 60  # tempo entre ciclos (use 60 para 1 em 1 minuto)
 
 # Perfil de uso de cada AP: quanto maior, mais tráfego a antena recebe
@@ -45,6 +57,15 @@ PESOS_BASE = {"ap01": 1.0, "ap02": 0.9, "ap03": 1.1}
 VARIACAO_PESO = 0.15   # +/-15% de oscilação do peso a cada ciclo
 VARIACAO_CONN = 10     # +/- dispositivos conectados entre as APs
 VARIACAO_PCT = 5.0     # +/- pontos percentuais em CPU e RAM entre as APs
+
+# Cliente S3
+session = boto3.Session(
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    aws_session_token=AWS_SESSION_TOKEN,
+    region_name=AWS_REGION,
+)
+s3_client = session.client("s3")
 
 # Estado entre ciclos (contadores acumulados simulados de cada AP)
 _acumulado = {ap: {"sent": 0, "recv": 0} for ap in ANTENAS}
@@ -116,46 +137,71 @@ def coletar_metricas_todas() -> list[dict]:
 
 
 # ----------------------------- Armazenamento ------------------------------
-def obter_caminho_do_dia(id_antena: str) -> str:
+def obter_chave_do_dia(id_antena: str) -> str:
     """
-    Retorna o caminho do JSON do dia atual para a antena informada.
-    Se já existir um arquivo de hoje para ela, reutiliza; senão, define um
-    novo com o horário atual no nome (AAAA-MM-DD_HH-MM_apXX.json).
+    Retorna a chave (caminho no bucket) do JSON do dia atual para a antena.
+    Se já existir um objeto de hoje para ela, reutiliza; senão, define uma
+    nova chave com o horário atual (PREFIXO/AAAA-MM-DD_HH-MM_apXX.json).
     """
-    os.makedirs(PASTA_SAIDA, exist_ok=True)
-
     agora = datetime.now()
     data_hoje = agora.strftime("%Y-%m-%d")
 
-    existentes = sorted(
-        glob.glob(os.path.join(PASTA_SAIDA, f"{data_hoje}_*_{id_antena}.json"))
-    )
+    prefixo_busca = f"{PREFIXO_S3}/{data_hoje}_"
+    sufixo = f"_{id_antena}.json"
+
+    existentes = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for pagina in paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefixo_busca):
+        for obj in pagina.get("Contents", []):
+            if obj["Key"].endswith(sufixo):
+                existentes.append(obj["Key"])
+
     if existentes:
-        return existentes[0]
+        return sorted(existentes)[0]
 
     nome = f"{data_hoje}_{agora.strftime('%H-%M')}_{id_antena}.json"
-    return os.path.join(PASTA_SAIDA, nome)
+    return f"{PREFIXO_S3}/{nome}"
+
+
+def ler_json_s3(chave: str) -> pd.DataFrame | None:
+    """Lê o JSON do S3 e devolve um DataFrame. Retorna None se o objeto não existir."""
+    try:
+        resposta = s3_client.get_object(Bucket=BUCKET_NAME, Key=chave)
+    except ClientError as erro:
+        if erro.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+    conteudo = resposta["Body"].read().decode("utf-8")
+    return pd.read_json(io.StringIO(conteudo), orient="records", dtype=False)
 
 
 def salvar_json(registro: dict) -> tuple[str, int]:
-    """Adiciona o registro ao JSON do dia da antena. Retorna (caminho, total de linhas)."""
-    caminho = obter_caminho_do_dia(registro["ID_antena"])
+    """Adiciona o registro ao JSON do dia da antena no S3. Retorna (chave, total de linhas)."""
+    chave = obter_chave_do_dia(registro["ID_antena"])
     novo = pd.DataFrame([registro])
 
-    if os.path.exists(caminho):
-        try:
-            historico = pd.read_json(caminho, orient="records", dtype=False)
-            df = pd.concat([historico, novo], ignore_index=True)
-        except ValueError:
-            print("[AVISO] Arquivo JSON inválido/vazio. Recriando o arquivo...")
-            df = novo
+    try:
+        historico = ler_json_s3(chave)
+    except ValueError:
+        print("[AVISO] Arquivo JSON inválido/vazio. Recriando o arquivo...")
+        historico = None
+
+    if historico is not None:
+        df = pd.concat([historico, novo], ignore_index=True)
     else:
-        print(f"[INFO] Novo dia/arquivo. Criando '{caminho}'...")
+        print(f"[INFO] Novo dia/arquivo. Criando 's3://{BUCKET_NAME}/{chave}'...")
         df = novo
 
     df["Timestamp"] = df["Timestamp"].astype(str)
-    df.to_json(caminho, orient="records", indent=4, force_ascii=False)
-    return caminho, len(df)
+    corpo = df.to_json(orient="records", indent=4, force_ascii=False)
+
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=chave,
+        Body=corpo.encode("utf-8"),
+        ContentType="application/json",
+    )
+    return chave, len(df)
 
 
 # ------------------------------ Execução ----------------------------------
@@ -163,7 +209,7 @@ def main() -> None:
     print("=" * 60)
     print(" Monitoramento simultâneo de antenas iniciado")
     print(f" Antenas: {', '.join(ANTENAS)}")
-    print(f" Intervalo: {INTERVALO_SEGUNDOS}s | Pasta: {PASTA_SAIDA}/")
+    print(f" Intervalo: {INTERVALO_SEGUNDOS}s | Destino: s3://{BUCKET_NAME}/{PREFIXO_S3}/")
     print(" Pressione Ctrl+C para encerrar.")
     print("=" * 60)
 
@@ -184,8 +230,8 @@ def main() -> None:
                     f"CPU: {r['CPU_Usage']:>5}% | RAM: {r['RAM_Usage']:>5}% | "
                     f"Enviados: {r['Bytes_Sent']:,} B | Recebidos: {r['Bytes_Recv']:,} B"
                 )
-                caminho, total = salvar_json(r)
-                print(f"         salvo em '{caminho}' (total no dia: {total})")
+                chave, total = salvar_json(r)
+                print(f"         salvo em 's3://{BUCKET_NAME}/{chave}' (total no dia: {total})")
 
             print(f"[TOTAL]  Soma de Bytes_Sent das APs: {soma_sent:,} B")
 

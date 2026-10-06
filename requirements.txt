@@ -1,3 +1,4 @@
 pandas
 psutil
 boto3
+dotenv
