@@ -1,51 +1,28 @@
-"""
-Camada 02 - Consolidação e correlação dos dados (JSON -> CSV).
-
-Lê os JSONs brutos gerados pelos scripts de captura:
-  - antena/     -> 3 APs (ap01, ap02, ap03)
-  - firewalls/  -> 1 firewall (fw01)
-e gera UM único CSV consolidado (consolidado/dados_consolidados.csv).
-
-O que o script faz:
-  1. Timestamp legível (YYYY-MM-DD HH:MM:SS).
-  2. Vazão (Mbps): diferença de bytes entre a coleta atual e a anterior do
-     mesmo dispositivo, dividida pelo intervalo real entre as duas coletas.
-  3. status_carga:
-        Active_conn > 40  -> alta densidade
-        CPU_Usage   > 80% -> gargalo de processamento
-        RAM_Usage   > 75% -> OOM (Out Of Memory)
-        (várias condições podem aparecer juntas; sem nenhuma -> normal)
-  4. Consistência de tráfego (por minuto): soma do Bytes_Sent (delta) de todas
-     as APs comparada ao Bytes_Sent (delta) da interface WAN do firewall.
-  5. Correlação ponta x centro: cada linha traz, para o minuto correspondente,
-     a soma de conexões das APs e as sessões ativas do firewall.
-
-O arquivo é regerado por completo a cada ciclo (idempotente), então pode ser
-executado quantas vezes quiser.
-
-Uso:
-    python consolidar_dados.py                 # loop a cada 3 minutos
-    python consolidar_dados.py --intervalo 120 # loop a cada 2 minutos
-    python consolidar_dados.py --uma-vez       # executa uma vez e sai
-"""
-
 import argparse
 import csv
-import glob
+import io
 import json
-import os
+import re
 import time
 from datetime import datetime
 
-# ----------------------------- Configurações ------------------------------
-PASTA_ANTENAS = "antena"
-PASTA_FIREWALLS = "firewalls"
-PASTA_SAIDA = "consolidado"
-ARQUIVO_CSV = os.path.join(PASTA_SAIDA, "dados_consolidados.csv")
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
-INTERVALO_PADRAO_SEG = 180   # 3 minutos entre consolidações
-QTD_APS_ESPERADAS = 3        # ap01, ap02, ap03
-TOLERANCIA_PCT = 10.0        # desvio aceitável na consistência de tráfego
+
+AWS_REGION = "us-east-1"
+BUCKET_NAME = "itops-gama"
+PREFIXO_BRONZE = "01-bronze"
+PREFIXO_SILVER = "02-silver"
+CHAVE_CSV = f"{PREFIXO_SILVER}/dados_consolidados.csv"
+
+
+PADRAO_ANTENAS = re.compile(r"_ap\d+\.json$")
+PADRAO_FIREWALLS = re.compile(r"_fw\d+\.json$")
+
+INTERVALO_PADRAO_SEG = 180
+QTD_APS_ESPERADAS = 3
+TOLERANCIA_PCT = 10.0
 
 LIMITE_ACTIVE_CONN = 40
 LIMITE_CPU = 80
@@ -61,6 +38,8 @@ COLUNAS = [
     "Minuto_Soma_Delta_Sent_APs", "Minuto_FW_Delta_Sent",
     "Minuto_Diferenca_Bytes", "Minuto_Desvio_pct", "status_consistencia",
 ]
+
+s3_client = boto3.client("s3", region_name=AWS_REGION)
 
 
 # ------------------------------- Leitura ----------------------------------
@@ -83,18 +62,29 @@ def interpretar_timestamp(valor):
     return None
 
 
-def ler_pasta(pasta: str, tipo: str) -> list[dict]:
-    """Lê todos os JSONs de uma pasta e devolve registros normalizados."""
-    arquivos = sorted(glob.glob(os.path.join(pasta, "*.json")))
-    print(f"[LEITURA] {pasta}/: {len(arquivos)} arquivo(s) JSON encontrado(s).")
+def listar_chaves_bronze() -> list[str]:
+    """Lista todas as chaves .json do prefixo bronze (ignora o marcador de pasta)."""
+    chaves = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for pagina in paginator.paginate(Bucket=BUCKET_NAME, Prefix=f"{PREFIXO_BRONZE}/"):
+        for obj in pagina.get("Contents", []):
+            if obj["Key"].endswith(".json"):
+                chaves.append(obj["Key"])
+    return sorted(chaves)
+
+
+def ler_registros(chaves: list[str], tipo: str) -> list[dict]:
+    """Lê os JSONs informados do S3 e devolve registros normalizados."""
+    print(f"[LEITURA] s3://{BUCKET_NAME}/{PREFIXO_BRONZE}/ ({tipo}): "
+          f"{len(chaves)} arquivo(s) JSON encontrado(s).")
 
     registros, vistos = [], set()
-    for caminho in arquivos:
+    for chave in chaves:
         try:
-            with open(caminho, encoding="utf-8") as f:
-                dados = json.load(f)
-        except (json.JSONDecodeError, OSError) as erro:
-            print(f"[AVISO] Ignorando '{caminho}': {erro}")
+            resposta = s3_client.get_object(Bucket=BUCKET_NAME, Key=chave)
+            dados = json.loads(resposta["Body"].read().decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, ClientError, BotoCoreError) as erro:
+            print(f"[AVISO] Ignorando '{chave}': {erro}")
             continue
 
         if isinstance(dados, dict):
@@ -105,10 +95,10 @@ def ler_pasta(pasta: str, tipo: str) -> list[dict]:
             id_disp = r.get("ID_antena") or r.get("ID_firewall") or r.get("ID")
             if ts is None or not id_disp:
                 continue
-            chave = (id_disp, ts)
-            if chave in vistos:  # evita duplicatas
+            chave_unica = (id_disp, ts)
+            if chave_unica in vistos:
                 continue
-            vistos.add(chave)
+            vistos.add(chave_unica)
 
             registros.append({
                 "ts": ts,
@@ -153,7 +143,7 @@ def calcular_vazao(registros: list[dict]) -> int:
                     d_sent = d_recv = None
 
                 if d_sent is not None and intervalo > 0:
-                    if d_sent < 0 or d_recv < 0:  # contador zerou (reinício)
+                    if d_sent < 0 or d_recv < 0:
                         resets += 1
                     else:
                         mbps_s = d_sent * 8 / intervalo / 1_000_000
@@ -205,7 +195,6 @@ def correlacionar_por_minuto(registros: list[dict]) -> dict:
                 m["fw_delta_sent"] = (m["fw_delta_sent"] or 0) + r["Delta_Sent"]
 
     for m in minutos.values():
-        # Conexões/sessões: média das amostras do minuto (não soma de todas elas)
         m["soma_conn"] = round(sum(sum(v) / len(v) for v in m["conn_por_ap"].values()))
         m["fw_sessoes"] = round(sum(m["sessoes"]) / len(m["sessoes"])) if m["sessoes"] else None
         fw = m["fw_delta_sent"]
@@ -225,7 +214,6 @@ def correlacionar_por_minuto(registros: list[dict]) -> dict:
     return minutos
 
 
-# ------------------------------- Escrita ----------------------------------
 def montar_linha(r: dict, m: dict) -> dict:
     return {
         "Timestamp": r["ts"].strftime("%Y-%m-%d %H:%M:%S"),
@@ -251,22 +239,33 @@ def montar_linha(r: dict, m: dict) -> dict:
 
 
 def gravar_csv(linhas: list[dict]) -> None:
-    """Grava o CSV de forma segura (arquivo temporário + substituição)."""
-    os.makedirs(PASTA_SAIDA, exist_ok=True)
-    temporario = ARQUIVO_CSV + ".tmp"
-    with open(temporario, "w", newline="", encoding="utf-8-sig") as f:
-        escritor = csv.DictWriter(f, fieldnames=COLUNAS)
-        escritor.writeheader()
-        escritor.writerows(linhas)
-    os.replace(temporario, ARQUIVO_CSV)
+    """
+    Monta o CSV em memória e envia ao S3 (camada silver).
+    O put_object é atômico: o objeto antigo só é substituído quando o novo
+    upload termina, então quem lê nunca vê um arquivo pela metade.
+    """
+    buffer = io.StringIO()
+    escritor = csv.DictWriter(buffer, fieldnames=COLUNAS)
+    escritor.writeheader()
+    escritor.writerows(linhas)
+
+    s3_client.put_object(
+        Bucket=BUCKET_NAME,
+        Key=CHAVE_CSV,
+        Body=buffer.getvalue().encode("utf-8-sig"),
+        ContentType="text/csv",
+    )
 
 
-# ------------------------------ Execução ----------------------------------
 def consolidar() -> None:
     inicio = time.time()
     print("\n[CONSOLIDAÇÃO] Iniciando leitura dos dados brutos...")
 
-    registros = ler_pasta(PASTA_ANTENAS, "AP") + ler_pasta(PASTA_FIREWALLS, "FW")
+    chaves = listar_chaves_bronze()
+    chaves_aps = [c for c in chaves if PADRAO_ANTENAS.search(c)]
+    chaves_fws = [c for c in chaves if PADRAO_FIREWALLS.search(c)]
+
+    registros = ler_registros(chaves_aps, "AP") + ler_registros(chaves_fws, "FW")
     if not registros:
         print("[AVISO] Nenhum registro encontrado. Aguardando novas capturas...")
         return
@@ -288,18 +287,17 @@ def consolidar() -> None:
     linhas = [montar_linha(r, minutos[r["Minuto"]]) for r in registros]
     gravar_csv(linhas)
 
-    # Resumo no terminal
     resumo = {}
     for m in minutos.values():
         resumo[m["status"]] = resumo.get(m["status"], 0) + 1
     alertas = sum(1 for r in registros if r["status_carga"] != "normal")
-    print(f"[SALVO] {len(linhas)} linha(s) gravada(s) em '{ARQUIVO_CSV}'.")
+    print(f"[SALVO] {len(linhas)} linha(s) gravada(s) em 's3://{BUCKET_NAME}/{CHAVE_CSV}'.")
     print(f"[RESUMO] Consistência por minuto: {resumo} | Registros com alerta de carga: {alertas}")
     print(f"[OK] Consolidação concluída em {time.time() - inicio:.1f}s.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Consolida JSONs de APs e firewall em CSV.")
+    parser = argparse.ArgumentParser(description="Consolida JSONs de APs e firewall (S3 bronze) em CSV (S3 silver).")
     parser.add_argument("--intervalo", type=int, default=INTERVALO_PADRAO_SEG,
                         help="segundos entre consolidações (padrão: 180)")
     parser.add_argument("--uma-vez", action="store_true",
@@ -308,7 +306,7 @@ def main() -> None:
 
     print("=" * 60)
     print(" Consolidação de dados (Camada 02) iniciada")
-    print(f" Origem: {PASTA_ANTENAS}/ + {PASTA_FIREWALLS}/ | Saída: {ARQUIVO_CSV}")
+    print(f" Origem: s3://{BUCKET_NAME}/{PREFIXO_BRONZE}/ | Saída: s3://{BUCKET_NAME}/{CHAVE_CSV}")
     if not args.uma_vez:
         print(f" Intervalo: {args.intervalo}s | Ctrl+C para encerrar.")
     print("=" * 60)

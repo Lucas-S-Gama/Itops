@@ -1,26 +1,3 @@
-"""
-Captura de métricas de firewalls (simulados) a cada 1 minuto.
-
-Coleta:
-  - ID_firewall      : alterna entre os firewalls configurados (um por ciclo)
-  - Active_sessions  : número de sessões TCP/UDP ativas (psutil.net_connections),
-                       com fallback para valor simulado se faltar permissão
-  - Dropped_packets  : pacotes descartados (dropin + dropout de psutil.net_io_counters())
-  - Top_blocked_IP   : IP SIMULADO tentando acesso forçado (ataque DoS) e bloqueado
-  - CPU/RAM_Usage    : uso de CPU e RAM em percentual
-  - Bytes_Sent/Recv  : contadores de rede via psutil.net_io_counters()
-
-Armazenamento (AWS S3):
-  - Bucket e prefixo ("pasta") configurados abaixo
-  - Um objeto JSON por dia PARA CADA firewall, no formato:
-        <PREFIXO_S3>/AAAA-MM-DD_HH-MM_fwXX.json   (ex.: firewalls/2026-04-06_10-30_fw01.json)
-    O HH-MM é o horário da primeira captura daquele firewall no dia, quando o
-    objeto é criado. Nas capturas seguintes do mesmo dia, os registros são
-    adicionados ao mesmo objeto. Ao virar o dia, novos objetos são criados.
-
-Para encerrar, use Ctrl+C.
-"""
-
 import io
 import itertools
 import random
@@ -35,9 +12,6 @@ from botocore.exceptions import ClientError
 
 load_dotenv()
 
-
-# ----------------------------- Configurações ------------------------------
-# AWS  (preencha com as informações corretas)
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
@@ -45,10 +19,9 @@ AWS_REGION = os.getenv("AWS_REGION")
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 PREFIXO_S3 = os.getenv("PREFIXO_S3")
 
-FIREWALLS = ["fw01"]  # ordem de alternância entre os firewalls
-INTERVALO_SEGUNDOS = 60            # loop de 1 em 1 minuto
+FIREWALLS = ["fw01"]
+INTERVALO_SEGUNDOS = 60
 
-# Cliente S3
 session = boto3.Session(
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -66,7 +39,7 @@ def contar_sessoes_ativas() -> tuple[int, bool]:
     nesse caso o valor é simulado.
     """
     try:
-        conexoes = psutil.net_connections(kind="inet")  # inet = TCP + UDP (IPv4/IPv6)
+        conexoes = psutil.net_connections(kind="inet")
         return len(conexoes), False
     except (psutil.AccessDenied, PermissionError):
         return random.randint(200, 5000), True
@@ -89,7 +62,6 @@ def coletar_metricas(id_firewall: str) -> dict:
         "Sessions_simulated": simulado,
         "Dropped_packets": rede.dropin + rede.dropout,
         "Top_blocked_IP": gerar_ip_atacante(),
-        # interval=1 mede o uso real da CPU durante 1 segundo
         "CPU_Usage": psutil.cpu_percent(interval=1),
         "RAM_Usage": psutil.virtual_memory().percent,
         "Bytes_Sent": rede.bytes_sent,
@@ -97,13 +69,7 @@ def coletar_metricas(id_firewall: str) -> dict:
     }
 
 
-# ----------------------------- Armazenamento ------------------------------
 def obter_chave_do_dia(id_firewall: str) -> str:
-    """
-    Retorna a chave (caminho no bucket) do JSON do dia atual para o firewall.
-    Se já existir um objeto de hoje para ele, reutiliza; senão, define uma
-    nova chave com o horário atual (PREFIXO/AAAA-MM-DD_HH-MM_fwXX.json).
-    """
     agora = datetime.now()
     data_hoje = agora.strftime("%Y-%m-%d")
 
@@ -125,7 +91,6 @@ def obter_chave_do_dia(id_firewall: str) -> str:
 
 
 def ler_json_s3(chave: str) -> pd.DataFrame | None:
-    """Lê o JSON do S3 e devolve um DataFrame. Retorna None se o objeto não existir."""
     try:
         resposta = s3_client.get_object(Bucket=BUCKET_NAME, Key=chave)
     except ClientError as erro:
@@ -137,7 +102,6 @@ def ler_json_s3(chave: str) -> pd.DataFrame | None:
 
 
 def salvar_json(registro: dict) -> tuple[str, int]:
-    """Adiciona o registro ao JSON do dia do firewall no S3. Retorna (chave, total de linhas)."""
     chave = obter_chave_do_dia(registro["ID_firewall"])
     novo = pd.DataFrame([registro])
 
@@ -206,7 +170,6 @@ def main() -> None:
                 f"(total no dia: {total})."
             )
 
-            # Desconta o tempo gasto na coleta para manter o intervalo de ~60s
             espera = 60 - (time.time() % 60)
             print(f"[AGUARDANDO] Próximo ciclo em {espera:.0f} segundos...")
             time.sleep(espera)

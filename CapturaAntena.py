@@ -1,31 +1,3 @@
-"""
-Captura de métricas de antenas (simuladas) - as 3 APs ao mesmo tempo.
-
-A cada ciclo, o script coleta UMA vez as métricas reais da máquina (psutil) e
-gera, a partir delas, os registros de ap01, ap02 e ap03 com leves divergências
-entre si, simulando o monitoramento simultâneo das três antenas.
-
-Coleta (por AP):
-  - ID_antena        : ap01, ap02 e ap03 (todas no mesmo ciclo)
-  - Bytes_Sent/Recv  : contadores de rede derivados de psutil.net_io_counters().
-                       O tráfego real do ciclo é DIVIDIDO entre as APs (com
-                       pesos levemente diferentes), então a soma das 3 APs
-                       fecha com o tráfego real da máquina e os contadores
-                       de cada AP continuam sempre crescentes.
-  - Active_conn      : contagem SIMULADA de dispositivos (varia entre as APs)
-  - CPU/RAM_Usage    : percentual real com pequena variação por AP
-
-Armazenamento (AWS S3):
-  - Bucket e prefixo ("pasta") configurados abaixo
-  - Um objeto JSON por dia PARA CADA antena, no formato:
-        <PREFIXO_S3>/AAAA-MM-DD_HH-MM_apXX.json   (ex.: 01-bronze/2026-04-06_10-30_ap01.json)
-    O HH-MM é o horário da primeira captura daquela antena no dia, quando o
-    objeto é criado. Nas capturas seguintes do mesmo dia, os registros são
-    adicionados ao mesmo objeto. Ao virar o dia, novos objetos são criados.
-
-Para encerrar, use Ctrl+C.
-"""
-
 import io
 import random
 import time
@@ -40,8 +12,7 @@ from botocore.exceptions import ClientError
 
 
 load_dotenv()
-# ----------------------------- Configurações ------------------------------
-# AWS  (preencha com as informações corretas)
+
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")
@@ -50,15 +21,13 @@ BUCKET_NAME = os.getenv("BUCKET_NAME")
 PREFIXO_S3 = os.getenv("PREFIXO_S3")
 
 ANTENAS = ["ap01", "ap02", "ap03"]
-INTERVALO_SEGUNDOS = 60  # tempo entre ciclos (use 60 para 1 em 1 minuto)
+INTERVALO_SEGUNDOS = 60
 
-# Perfil de uso de cada AP: quanto maior, mais tráfego a antena recebe
 PESOS_BASE = {"ap01": 1.0, "ap02": 0.9, "ap03": 1.1}
-VARIACAO_PESO = 0.15   # +/-15% de oscilação do peso a cada ciclo
-VARIACAO_CONN = 10     # +/- dispositivos conectados entre as APs
-VARIACAO_PCT = 5.0     # +/- pontos percentuais em CPU e RAM entre as APs
+VARIACAO_PESO = 0.15
+VARIACAO_CONN = 10
+VARIACAO_PCT = 5.0
 
-# Cliente S3
 session = boto3.Session(
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -67,12 +36,10 @@ session = boto3.Session(
 )
 s3_client = session.client("s3")
 
-# Estado entre ciclos (contadores acumulados simulados de cada AP)
 _acumulado = {ap: {"sent": 0, "recv": 0} for ap in ANTENAS}
 _ultimo_host = None
 
 
-# ------------------------------- Coleta -----------------------------------
 def _limitar_pct(valor: float) -> float:
     return round(min(100.0, max(0.0, valor)), 1)
 
@@ -104,9 +71,8 @@ def coletar_metricas_todas() -> list[dict]:
     rede = psutil.net_io_counters()
     cpu = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory().percent
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # igual para as 3 APs
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Tráfego real ocorrido desde o ciclo anterior (no 1º ciclo, o total atual)
     if _ultimo_host is None:
         delta_sent, delta_recv = rede.bytes_sent, rede.bytes_recv
     else:
@@ -118,7 +84,7 @@ def coletar_metricas_todas() -> list[dict]:
     parte_sent = _dividir(delta_sent, fracoes)
     parte_recv = _dividir(delta_recv, fracoes)
 
-    base_conn = random.randint(20, 100)  # carga geral do ciclo; cada AP varia em torno dela
+    base_conn = random.randint(20, 100)
 
     registros = []
     for ap in ANTENAS:
@@ -136,7 +102,6 @@ def coletar_metricas_todas() -> list[dict]:
     return registros
 
 
-# ----------------------------- Armazenamento ------------------------------
 def obter_chave_do_dia(id_antena: str) -> str:
     """
     Retorna a chave (caminho no bucket) do JSON do dia atual para a antena.
@@ -204,7 +169,6 @@ def salvar_json(registro: dict) -> tuple[str, int]:
     return chave, len(df)
 
 
-# ------------------------------ Execução ----------------------------------
 def main() -> None:
     print("=" * 60)
     print(" Monitoramento simultâneo de antenas iniciado")
@@ -235,7 +199,6 @@ def main() -> None:
 
             print(f"[TOTAL]  Soma de Bytes_Sent das APs: {soma_sent:,} B")
 
-            # Desconta o tempo gasto na coleta para manter o intervalo definido
             espera = 60 - (time.time() % 60)
             print(f"[AGUARDANDO] Próximo ciclo em {espera:.0f} segundos...")
             time.sleep(espera)

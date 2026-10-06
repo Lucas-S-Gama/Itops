@@ -1,47 +1,27 @@
-"""
-Camada 03 - OURO (analytics): Mapa de Calor Logístico.
-
-Pergunta de negócio: "Onde estão os usuários?"
-Cruza o tráfego de cada antena (ponta) com a saída do firewall (centro) e
-identifica qual antena/setor do prédio consome mais internet, para decidir
-onde investir em links mais rápidos.
-
-Lê o CSV consolidado (camada prata) e gera em 'ouro/':
-
-  1. mapa_calor_logistico.csv  -> por hora e por antena: volume, vazão, % do tráfego
-                                  das APs na hora, ranking e saída do firewall
-  2. ranking_antenas.csv       -> visão geral do período: quem consome mais e
-                                  quantas horas cada antena foi a líder
-
-Uso:
-    python gerar_ouro.py
-    python gerar_ouro.py --entrada consolidado/dados_consolidados.csv --saida ouro
-    python gerar_ouro.py --bucket meu-bucket --prefixo 03-gold   # envia ao S3 (opcional)
-"""
-
 import argparse
-import os
+import io
 
+import boto3
 import pandas as pd
 
-ENTRADA_PADRAO = os.path.join("consolidado", "dados_consolidados.csv")
-SAIDA_PADRAO = "ouro"
+AWS_REGION = "us-east-1"
+BUCKET_PADRAO = "itops-gama"
+CHAVE_ENTRADA_PADRAO = "02-silver/dados_consolidados.csv"
+PREFIXO_GOLD_PADRAO = "03-gold"
 
-# Edite com os setores reais do prédio (cada antena cobre um setor)
 SETORES = {"ap01": "Setor A", "ap02": "Setor B", "ap03": "Setor C"}
 
+s3_client = boto3.client("s3", region_name=AWS_REGION)
 
-# ------------------------------- Leitura ----------------------------------
-def carregar(caminho: str) -> pd.DataFrame:
-    df = pd.read_csv(caminho, encoding="utf-8-sig")
+def carregar(bucket: str, chave: str) -> pd.DataFrame:
+    """Baixa o CSV consolidado (prata) do S3 e prepara as colunas de análise."""
+    resposta = s3_client.get_object(Bucket=bucket, Key=chave)
+    df = pd.read_csv(io.BytesIO(resposta["Body"].read()), encoding="utf-8-sig")
     df["Timestamp"] = pd.to_datetime(df["Timestamp"])
     df["Hora"] = df["Timestamp"].dt.floor("h")
-    # Volume total (enviado + recebido) de cada intervalo; vazio na 1ª coleta de cada dispositivo
     df["Bytes_Total"] = df["Delta_Sent"] + df["Delta_Recv"]
     return df
 
-
-# ------------------------------ Agregações --------------------------------
 def mapa_calor(df: pd.DataFrame) -> pd.DataFrame:
     """Uma linha por hora e antena, com a parcela de cada AP no tráfego da hora."""
     aps = df[df["Tipo"] == "AP"].dropna(subset=["Bytes_Total"])
@@ -62,7 +42,6 @@ def mapa_calor(df: pd.DataFrame) -> pd.DataFrame:
     )
     por_ap["Setor"] = por_ap["ID"].map(SETORES).fillna("N/D")
 
-    # Saída do firewall na mesma hora (centro) e quanto das APs ela cobre
     saida_fw = fw.groupby("Hora")["Bytes_Total"].sum().rename("Bytes_Firewall")
     por_ap = por_ap.merge(saida_fw, on="Hora", how="left")
     por_ap["Firewall_MB"] = por_ap["Bytes_Firewall"] / 1_000_000
@@ -98,45 +77,41 @@ def arredondar(tabela: pd.DataFrame) -> pd.DataFrame:
     return tabela
 
 
-# ------------------------------ S3 (opcional) -----------------------------
-def enviar_s3(arquivos: list[str], bucket: str, prefixo: str) -> None:
-    import boto3  # importado aqui para não exigir boto3 quando não usar S3
-    s3 = boto3.client("s3")
-    for caminho in arquivos:
-        chave = f"{prefixo}/{os.path.basename(caminho)}"
-        s3.upload_file(caminho, bucket, chave)
-        print(f"[S3] s3://{bucket}/{chave}")
+def enviar_csv_s3(tabela: pd.DataFrame, bucket: str, chave: str) -> None:
+    """Converte a tabela em CSV (em memória) e envia ao S3."""
+    corpo = tabela.to_csv(index=False)
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=chave,
+        Body=corpo.encode("utf-8-sig"),
+        ContentType="text/csv",
+    )
 
 
-# ------------------------------ Execução ----------------------------------
 def main() -> None:
-    p = argparse.ArgumentParser(description="Gera o Mapa de Calor Logístico (camada ouro).")
-    p.add_argument("--entrada", default=ENTRADA_PADRAO)
-    p.add_argument("--saida", default=SAIDA_PADRAO)
-    p.add_argument("--bucket", help="se informado, envia os CSVs ao S3")
-    p.add_argument("--prefixo", default="03-gold", help="prefixo no bucket (padrão: 03-gold)")
+    p = argparse.ArgumentParser(description="Gera o Mapa de Calor Logístico (camada ouro) no S3.")
+    p.add_argument("--bucket", default=BUCKET_PADRAO,
+                   help=f"bucket S3 (padrão: {BUCKET_PADRAO})")
+    p.add_argument("--chave-entrada", default=CHAVE_ENTRADA_PADRAO,
+                   help=f"chave do CSV prata no bucket (padrão: {CHAVE_ENTRADA_PADRAO})")
+    p.add_argument("--prefixo", default=PREFIXO_GOLD_PADRAO,
+                   help=f"prefixo de saída no bucket (padrão: {PREFIXO_GOLD_PADRAO})")
     args = p.parse_args()
 
-    df = carregar(args.entrada)
-    print(f"[LEITURA] {len(df)} linha(s) de '{args.entrada}'.")
+    df = carregar(args.bucket, args.chave_entrada)
+    print(f"[LEITURA] {len(df)} linha(s) de 's3://{args.bucket}/{args.chave_entrada}'.")
 
     mapa = mapa_calor(df)
     ranking = ranking_antenas(mapa)
 
-    os.makedirs(args.saida, exist_ok=True)
-    caminhos = []
     for nome, tabela in {"mapa_calor_logistico.csv": mapa, "ranking_antenas.csv": ranking}.items():
-        caminho = os.path.join(args.saida, nome)
-        tabela.to_csv(caminho, index=False, encoding="utf-8-sig")
-        caminhos.append(caminho)
-        print(f"[OURO] {caminho} ({len(tabela)} linha(s))")
+        chave = f"{args.prefixo}/{nome}"
+        enviar_csv_s3(tabela, args.bucket, chave)
+        print(f"[OURO] s3://{args.bucket}/{chave} ({len(tabela)} linha(s))")
 
     lider = ranking.iloc[0]
     print(f"[RESULTADO] Maior consumo: {lider['ID']} ({lider['Setor']}) com "
           f"{lider['Pct_do_Trafego_Total']:.1f}% do tráfego das APs.")
-
-    if args.bucket:
-        enviar_s3(caminhos, args.bucket, args.prefixo)
 
 
 if __name__ == "__main__":
